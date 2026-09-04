@@ -1,0 +1,34 @@
+services:
+  db:
+    image: postgres:15
+    container_name: insider_postgres
+    restart: always
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+
+  insider-bot:
+    build: .
+    container_name: insider_live_bot
+    restart: always
+    network_mode: "host"
+    depends_on:
+      - db
+    environment:
+      - TZ=Europe/Budapest
+    env_file:
+      - .env
+    volumes:
+      - ./feeder_cache.json:/app/feeder_cache.json
+      - ${HOST_IBC_PATH:-/home/laca/IBCLinux-3.23.0}:/home/laca/IBCLinux-3.23.0
+      - ${HOST_JTS_PATH:-/home/laca/Jts}:/home/laca/Jts
+      - ${HOST_JAVA_PATH:-/home/laca/.local}:/home/laca/.local
+    command: python scheduler.py
+
+volumes:
+  postgres_data:

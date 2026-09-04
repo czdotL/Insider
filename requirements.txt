@@ -1,0 +1,15 @@
+ib_insync
+pandas
+numpy
+yfinance
+beautifulsoup4
+requests
+pyTelegramBotAPI
+matplotlib
+schedule
+python-dotenv
+pydantic
+pydantic-settings
+sentry-sdk>=2.0.0
+psycopg2-binary>=2.9.9
+SQLAlchemy>=2.0.0
