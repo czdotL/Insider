@@ -6,6 +6,7 @@ from ib_insync import IB, Stock, MarketOrder, LimitOrder, StopOrder
 from config import config
 from notifier import TelegramNotifier
 from logger import logger
+from session_window import should_be_connected, is_attended_hours
 
 try:
     loop = asyncio.get_running_loop()
@@ -15,7 +16,14 @@ except RuntimeError:
 
 
 class IBConnector:
+    ALERT_AFTER_FAILURES = 3
+    BACKOFF_SECONDS = 600
+
     def __init__(self, host='127.0.0.1', port=4001, client_id=1):
+        self._consecutive_failures = 0
+        self._last_failed_attempt = 0
+        # True while a session was established and not deliberately closed (pause/weekend/shutdown)
+        self.had_session = False
         self.host = host
         self.port = port
         self.client_id = client_id
@@ -32,18 +40,12 @@ class IBConnector:
         self.ib.disconnectedEvent += self._on_disconnect
         self.ib.errorEvent += self._on_error
 
-    # Helper to prevent Telegram spam outside trading hours
+    # Helper to prevent Telegram spam outside trading hours.
+    # Single source of truth: the attended window (weekday 14:30-22:30) defined
+    # in session_window, so connection alerts and the scheduler agree on "when
+    # is someone awake to approve 2FA".
     def _is_active_hours(self) -> bool:
-        now = datetime.now()
-        if now.weekday() >= 5:
-            return False
-        if now.hour < 15 or now.hour > 22:
-            return False
-        if now.hour == 15 and now.minute < 15:
-            return False
-        if now.hour == 22 and now.minute > 15:
-            return False
-        return True
+        return is_attended_hours()
 
     # Connection management
     def _on_disconnect(self):
@@ -95,6 +97,7 @@ class IBConnector:
                     self.ib.connect(self.host, self.port, clientId=self.client_id)
                     self.ib.reqMarketDataType(3)
                     self._auth_alert_sent = False
+                    self.had_session = True
                     acct_msg = f" (Account: {self.account})" if self.account else ""
                     logger.info(f"Connected to IBKR{acct_msg}.")
                 except Exception as e:
@@ -112,6 +115,8 @@ class IBConnector:
                     self.ib.connect(self.host, self.port, clientId=self.client_id)
                     self.ib.reqMarketDataType(3)
                     self._auth_alert_sent = False
+                    self._consecutive_failures = 0
+                    self.had_session = True
                     logger.info("Persistent connection established with IBKR.")
                     return True
                 except Exception as e:
@@ -119,13 +124,18 @@ class IBConnector:
                     if attempt < max_retries:
                         time.sleep(retry_delay)
 
+            self._consecutive_failures += 1
+            self._last_failed_attempt = time.time()
             self._handle_auth_failure("Failed to connect after multiple attempts.")
             return False
 
     def _handle_auth_failure(self, error):
+        # Brief overnight drops reconnect without 2FA; only alert once failures persist.
+        if self._consecutive_failures < self.ALERT_AFTER_FAILURES:
+            return
         if not self._auth_alert_sent:
             self._auth_alert_sent = True
-            if self._is_active_hours():
+            if should_be_connected() and is_attended_hours():
                 self.notifier.send_message(
                     "<b>IBKR AUTHENTICATION REQUIRED!</b>\n\n"
                     "The bot cannot connect to IB Gateway.\n"
@@ -137,6 +147,10 @@ class IBConnector:
     def keepalive(self):
         with self._lock:
             if not self.ib.isConnected():
+                # After repeated failures stop hammering the gateway (each try can trigger a 2FA push).
+                if (self._consecutive_failures >= self.ALERT_AFTER_FAILURES
+                        and time.time() - self._last_failed_attempt < self.BACKOFF_SECONDS):
+                    return False
                 logger.warning("Keepalive: No connection, reconnecting...")
                 return self.connect_persistent(max_retries=2, retry_delay=5)
             try:
@@ -162,6 +176,7 @@ class IBConnector:
 
     def disconnect(self):
         with self._lock:
+            self.had_session = False
             if self.ib.isConnected():
                 self.ib.disconnect()
 
@@ -350,45 +365,7 @@ class IBConnector:
             if not self.ib.isConnected():
                 return None
 
-            contract = Stock(ticker, 'SMART', 'USD')
-            self.ib.qualifyContracts(contract)
-
-            [ticker_data] = self.ib.reqTickers(contract)
-            market_price = ticker_data.marketPrice()
-            if not market_price or market_price <= 0:
-                market_price = ticker_data.last if ticker_data.last > 0 else ticker_data.close
-
-            actual_price = market_price if (market_price and market_price > 0) else entry_price
-
-            qty = float(quantity)
-            sl_price = round(actual_price * (1 - config.stoploss_pct), 2)
-            tp_price = round(actual_price * (1 + config.takeprofit_pct), 2)
-
-            logger.info(f"Calculation base: ${actual_price:.2f} | SL: ${sl_price} | TP: ${tp_price}")
-
-            parent = MarketOrder('BUY', qty)
-            parent.orderId = self.ib.client.getReqId()
-            parent.tif = 'DAY'
-            parent.transmit = False
-            if self.account:
-                parent.account = self.account
-
-            stop_loss = StopOrder('SELL', qty, sl_price)
-            stop_loss.orderId = self.ib.client.getReqId()
-            stop_loss.parentId = parent.orderId
-            stop_loss.tif = 'GTC'
-            stop_loss.transmit = False
-            if self.account:
-                stop_loss.account = self.account
-
-            take_profit = LimitOrder('SELL', qty, tp_price)
-            take_profit.orderId = self.ib.client.getReqId()
-            take_profit.parentId = parent.orderId
-            take_profit.tif = 'GTC'
-            take_profit.transmit = True
-            if self.account:
-                take_profit.account = self.account
-
+            handler_attached = False
             fractional_error_caught = False
 
             def fractional_error_handler(reqId, errorCode, errorString, _contract):
@@ -397,9 +374,49 @@ class IBConnector:
                     if errorCode in (201, 10149, 10248, 10249) or "fractional" in errorString.lower():
                         fractional_error_caught = True
 
-            self.ib.errorEvent += fractional_error_handler
-
             try:
+                contract = Stock(ticker, 'SMART', 'USD')
+                self.ib.qualifyContracts(contract)
+
+                [ticker_data] = self.ib.reqTickers(contract)
+                market_price = ticker_data.marketPrice()
+                if not market_price or market_price <= 0:
+                    market_price = ticker_data.last if ticker_data.last > 0 else ticker_data.close
+
+                actual_price = market_price if (market_price and market_price > 0) else entry_price
+
+                qty = float(quantity)
+                sl_price = round(actual_price * (1 - config.stoploss_pct), 2)
+                tp_price = round(actual_price * (1 + config.takeprofit_pct), 2)
+
+                logger.info(f"Calculation base: ${actual_price:.2f} | SL: ${sl_price} | TP: ${tp_price}")
+
+                parent = MarketOrder('BUY', qty)
+                parent.orderId = self.ib.client.getReqId()
+                parent.tif = 'DAY'
+                parent.transmit = False
+                if self.account:
+                    parent.account = self.account
+
+                stop_loss = StopOrder('SELL', qty, sl_price)
+                stop_loss.orderId = self.ib.client.getReqId()
+                stop_loss.parentId = parent.orderId
+                stop_loss.tif = 'GTC'
+                stop_loss.transmit = False
+                if self.account:
+                    stop_loss.account = self.account
+
+                take_profit = LimitOrder('SELL', qty, tp_price)
+                take_profit.orderId = self.ib.client.getReqId()
+                take_profit.parentId = parent.orderId
+                take_profit.tif = 'GTC'
+                take_profit.transmit = True
+                if self.account:
+                    take_profit.account = self.account
+
+                self.ib.errorEvent += fractional_error_handler
+                handler_attached = True
+
                 self.ib.placeOrder(contract, parent)
                 self.ib.placeOrder(contract, stop_loss)
                 self.ib.placeOrder(contract, take_profit)
@@ -407,6 +424,7 @@ class IBConnector:
                 self.ib.sleep(1.5)
 
                 self.ib.errorEvent -= fractional_error_handler
+                handler_attached = False
 
                 if fractional_error_caught:
                     if fallback_quantity > 0:
@@ -429,7 +447,8 @@ class IBConnector:
                 return parent.orderId
 
             except Exception as e:
-                self.ib.errorEvent -= fractional_error_handler
+                if handler_attached:
+                    self.ib.errorEvent -= fractional_error_handler
                 logger.error(f"Order submission error: {e}", exc_info=True)
                 self.notifier.send_message(
                     f"<b>BROKER ERROR (Buy)</b>\n"
@@ -443,12 +462,12 @@ class IBConnector:
             self.connect()
             if not self.ib.isConnected():
                 return None
-            contract = Stock(ticker, 'SMART', 'USD')
-            self.ib.qualifyContracts(contract)
-            sell_order = MarketOrder('SELL', float(quantity))
-            if self.account:
-                sell_order.account = self.account
             try:
+                contract = Stock(ticker, 'SMART', 'USD')
+                self.ib.qualifyContracts(contract)
+                sell_order = MarketOrder('SELL', float(quantity))
+                if self.account:
+                    sell_order.account = self.account
                 trade = self.ib.placeOrder(contract, sell_order)
                 acct_msg = f" [Account: {self.account}]" if self.account else ""
                 logger.info(f"Sell order submitted: {ticker} (orderId: {trade.order.orderId}){acct_msg}")

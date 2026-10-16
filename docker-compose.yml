@@ -25,9 +25,10 @@ services:
       - .env
     volumes:
       - ./feeder_cache.json:/app/feeder_cache.json
-      - ${HOST_IBC_PATH:-/home/laca/IBCLinux-3.23.0}:/home/laca/IBCLinux-3.23.0
-      - ${HOST_JTS_PATH:-/home/laca/Jts}:/home/laca/Jts
-      - ${HOST_JAVA_PATH:-/home/laca/.local}:/home/laca/.local
+      - ./state:/app/state
+      - /home/laca/IBCLinux-3.23.0:/home/laca/IBCLinux-3.23.0
+      - /home/laca/Jts:/home/laca/Jts
+      - /home/laca/.local:/home/laca/.local
     command: python scheduler.py
 
 volumes:

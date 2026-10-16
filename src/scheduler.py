@@ -3,7 +3,6 @@ import os
 import schedule
 import threading
 import telebot
-import subprocess
 import asyncio
 import socket
 import numpy as np
@@ -41,6 +40,7 @@ from reconciler import Reconciler
 from history_logger import HistoryLogger
 from state_memory import StateMemory
 from connector import IBConnector
+from session_window import should_be_connected, set_paused, is_paused, is_attended_hours
 
 
 # GLOBAL PERSISTENT CONNECTION
@@ -61,9 +61,20 @@ _force_run_lock = threading.Lock()
 
 _gateway_requested = False
 _gateway_lock = threading.Lock()
-_trading_enabled = True
 
 # TELEGRAM BOT
+#
+# The VPS <-> api.telegram.org long-polling connection periodically hits
+# transient network blips (connection reset / read timeout / 502), which is
+# normal for any long-polling bot on the public internet. By default telebot
+# does NOT retry a failed request — a single blip tears down and restarts the
+# whole polling thread (visible as "Infinity polling exception" in Sentry).
+# Enabling RETRY_ON_ERROR retries the request itself first, so brief blips no
+# longer cause a full reconnect/log-storm.
+telebot.apihelper.RETRY_ON_ERROR = True
+telebot.apihelper.MAX_RETRIES = 3
+telebot.apihelper.RETRY_TIMEOUT = 2
+
 bot = telebot.TeleBot(config.telegram_token)
 
 
@@ -88,6 +99,8 @@ def handle_help(message):
         "<b>/connection</b> — IBKR connection status\n"
         "<b>/force</b> — Immediate bot run\n"
         "<b>/gateway</b> — Start IB Gateway\n"
+        "<b>/pause</b> — Disconnect from IBKR and stay disconnected (survives restarts)\n"
+        "<b>/resume</b> — Reconnect and resume\n"
         "<b>/help</b> — This message"
     )
     bot.send_message(message.chat.id, msg, parse_mode='HTML')
@@ -95,23 +108,25 @@ def handle_help(message):
 
 # /status Positions + P&L + SL/TP + Summary
 
-@bot.message_handler(commands=['stop'])
+@bot.message_handler(commands=['pause'])
 def handle_stop(message):
     if not is_authorized(message): return
-    global _trading_enabled
-    _trading_enabled = False
-    
+    set_paused(True)
+
     if persistent_broker.is_connected():
         persistent_broker.disconnect()
-        
-    bot.send_message(message.chat.id, "<b>EMERGENCY STOP ACTIVATED</b>\nBot disconnected from IBKR. Trading routines suspended.", parse_mode='HTML')
+
+    bot.send_message(message.chat.id, "<b>PAUSED</b>\nBot disconnected from IBKR and will stay disconnected (also after restarts) until /resume.", parse_mode='HTML')
 
 @bot.message_handler(commands=['resume'])
 def handle_resume(message):
     if not is_authorized(message): return
-    global _trading_enabled
-    _trading_enabled = True
-    bot.send_message(message.chat.id, "<b>TRADING RESUMED</b>\nBot will reconnect on the next scheduled routine.", parse_mode='HTML')
+    set_paused(False)
+    if should_be_connected() and is_attended_hours():
+        bot.send_message(message.chat.id, "<b>RESUMED</b>\nConnecting to IBKR — approve 2FA on your phone if asked.", parse_mode='HTML')
+        threading.Thread(target=_connect_now, daemon=True).start()
+    else:
+        bot.send_message(message.chat.id, "<b>RESUMED</b>\nNobody to approve 2FA now — the bot will connect at 14:30 on the next trading day.", parse_mode='HTML')
 
 @bot.message_handler(commands=['status'])
 def handle_status(message):
@@ -311,27 +326,19 @@ def handle_paper(message):
     bot.send_message(message.chat.id, "Querying paper experiment data...")
     try:
         from paper_logger import PaperLogger, STRATEGIES
-        import sqlite3
-        import os
-        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-        DB_PATH = os.path.join(BASE_DIR, 'paper_experiment.db')
 
-        if not os.path.exists(DB_PATH):
+        paper_log = PaperLogger()
+
+        signals_df = paper_log.get_signals_df()
+        if signals_df.empty:
             bot.send_message(message.chat.id, "<b>Paper Experiment</b>\n\nNo data yet.", parse_mode='HTML')
             return
 
-        paper_log = PaperLogger(db_path=DB_PATH)
-
-        with sqlite3.connect(DB_PATH) as c:
-            total_signals = c.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
-            today_str = datetime.now().strftime('%Y-%m-%d')
-            today_signals = c.execute("SELECT COUNT(*) FROM signals WHERE signal_date = ?", (today_str,)).fetchone()[0]
-            last_row = c.execute("SELECT ticker, signal_date FROM signals ORDER BY logged_at DESC LIMIT 1").fetchone()
-            last_str = f"{last_row[0]} ({last_row[1]})" if last_row else "—"
-
-        if total_signals == 0:
-            bot.send_message(message.chat.id, "<b>Paper Experiment</b>\n\nNo processed signals yet.", parse_mode='HTML')
-            return
+        total_signals = len(signals_df)
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        today_signals = int((signals_df['signal_date'] == today_str).sum())
+        last_row = signals_df.iloc[0]
+        last_str = f"{last_row['ticker']} ({last_row['signal_date']})"
 
         summary = paper_log.strategy_summary()
         STRAT_LABELS = {
@@ -460,30 +467,25 @@ def is_gateway_running() -> bool:
     return False
 
 def start_ib_gateway():
+    # The IB Gateway lifecycle is owned exclusively by the host systemd unit
+    # (ibgateway.service + its start/stop timers). The bot must NOT spawn its
+    # own gateway: a second xvfb-run/IBC instance collides with the systemd one
+    # on the IBC CommandServer port (7462), leaving zombie Xvfb processes and an
+    # unauthenticated gateway. Here we only check and, during attended hours,
+    # alert so the operator (or the 14:05 recovery timer) can bring it back.
     if not is_weekday():
         return
     if is_gateway_running():
-        logger.info("IB Gateway is already running — restart skipped.")
+        logger.info("IB Gateway is already running.")
         return
 
-    logger.info("Starting IB Gateway automatically...")
-    try:
-        if os.name == 'nt':
-            subprocess.Popen(r"C:\IBC\StartGateway.bat", shell=True)
-        else:
-            full_cmd = '/usr/bin/xvfb-run -a --server-args="-screen 0 1024x768x24" /home/laca/IBCLinux-3.23.0/gatewaystart.sh -inline'
-            subprocess.Popen(full_cmd, shell=True)
-
-        logger.info("Waiting for Gateway to boot (30 seconds)...")
-        time.sleep(30)
-        
-        if is_gateway_running():
-            logger.info("Gateway started successfully.")
-        else:
-            logger.warning("Gateway is not responding after 30 seconds.")
-            notifier.send_message("<b>IB Gateway startup slow!</b>\nCheck manually.")
-    except Exception as e:
-        logger.error(f"Error starting Gateway: {e}", exc_info=True)
+    logger.warning("IB Gateway is not running — systemd should recover it.")
+    if is_attended_hours():
+        notifier.send_message(
+            "<b>IB Gateway is down.</b>\n"
+            "systemd should restart it (or it comes back at 14:05). "
+            "Keep your phone ready to approve 2FA."
+        )
 
 
 def is_weekday() -> bool:
@@ -496,14 +498,21 @@ def keepalive_check():
     global _last_keepalive_attempt
     now = time.time()
 
-    # Free up session completely on weekends
-    if not is_weekday():
+    # Free up the session outside the weekly window (weekend) or while paused
+    if not should_be_connected():
         if persistent_broker.is_connected():
-            logger.info("Weekend detected — disconnecting broker to free up session for mobile app.")
+            logger.info("Outside weekly window or paused — disconnecting broker to free up session for mobile app.")
             persistent_broker.disconnect()
         return
 
     if now - _last_keepalive_attempt < 55:
+        return
+
+    # Overnight drops that the gateway heals by itself are re-joined quietly. A fresh session, or one that
+    # keeps failing (needs 2FA), waits for the afternoon when the user can approve it.
+    if (not persistent_broker.is_connected() and not is_attended_hours()
+            and (not persistent_broker.had_session
+                 or persistent_broker._consecutive_failures >= persistent_broker.ALERT_AFTER_FAILURES)):
         return
 
     _last_keepalive_attempt = now
@@ -543,8 +552,8 @@ def _check_force_run():
         if not _force_run_requested: return
         _force_run_requested = False
     
-    if not _trading_enabled:
-        bot.send_message(config.telegram_chatid, "Cannot force run: Bot is in STOP mode.")
+    if is_paused():
+        bot.send_message(config.telegram_chatid, "Cannot force run: Bot is PAUSED (/resume).")
         return
 
     logger.info("Manual run requested — starting on main thread...")
@@ -583,8 +592,29 @@ def prefetch_openinsider():
         logger.error(f"Pre-fetch error: {e}", exc_info=True)
 
 
+def _connect_now():
+    try:
+        if not is_gateway_running():
+            start_ib_gateway()
+        if persistent_broker.connect_persistent():
+            notifier.send_message("<b>Connected to IBKR.</b>")
+    except Exception as e:
+        logger.error(f"Connect error: {e}", exc_info=True)
+
+
+def daily_connect_warning():
+    if should_be_connected() and not persistent_broker.is_connected():
+        notifier.send_message("<b>IBKR connection in 5 minutes.</b>\nKeep your phone ready for 2FA.")
+
+
+def daily_connect():
+    if should_be_connected() and not persistent_broker.is_connected():
+        logger.info("Attended hours start — connecting to IBKR.")
+        _connect_now()
+
+
 def morning_routine():
-    if not is_weekday() or not _trading_enabled:
+    if not is_weekday() or is_paused():
         return
     try:
         logger.info("STARTING MORNING ROUTINE...")
@@ -634,6 +664,8 @@ def setup_schedule():
     schedule.every(5).seconds.do(_check_force_run)
     schedule.every(5).seconds.do(_check_gateway_start)
 
+    schedule.every().day.at("14:25").do(daily_connect_warning)
+    schedule.every().day.at("14:30").do(daily_connect)
     schedule.every().day.at("15:20").do(start_ib_gateway)
     schedule.every().day.at("15:20").do(prefetch_openinsider)
     schedule.every().day.at("15:30").do(morning_routine)
@@ -646,7 +678,9 @@ if __name__ == "__main__":
     logger.info("=" * 50)
     logger.info("INSIDER BOT — PERSISTENT MODE")
 
-    if is_gateway_running():
+    if not (should_be_connected() and is_attended_hours()):
+        logger.info("Outside weekly window, paused or nobody to approve 2FA — IBKR connection skipped at startup.")
+    elif is_gateway_running():
         persistent_broker.connect_persistent()
 
     tg_thread = threading.Thread(target=start_telegram_bot, daemon=True)

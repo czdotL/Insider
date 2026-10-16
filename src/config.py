@@ -2,6 +2,14 @@ from typing import Literal
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+def sqlalchemy_url(url: str) -> str:
+    """Pin the SQLAlchemy driver to psycopg2 (the installed one); newer SQLAlchemy may default to psycopg3."""
+    for prefix in ("postgresql://", "postgres://"):
+        if url.startswith(prefix):
+            return "postgresql+psycopg2://" + url[len(prefix):]
+    return url
+
+
 class TradingConfig(BaseSettings):
 
     database_url: str = Field(..., description="PostgreSQL connection string")

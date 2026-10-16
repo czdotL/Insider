@@ -81,20 +81,20 @@ def run_trading_bot(broker=None):
 
         if exit_signals:
             for exit_order in exit_signals:
-                logger.info(f" -> Exit: {exit_order['quantity']:g} pcs {exit_order['ticker']} ({exit_order['reason']})")
+                logger.info(f" -> Exit: {exit_order.quantity:g} pcs {exit_order.ticker} ({exit_order.reason})")
 
                 order_id = connector.place_sell_order(
-                    ticker=exit_order['ticker'],
-                    quantity=exit_order['quantity']
+                    ticker=exit_order.ticker,
+                    quantity=exit_order.quantity
                 )
 
                 if order_id:
-                    memory.add_pending_order(order_id, exit_order['ticker'], 'SELL', exit_order['quantity'], 'Submitted')
+                    memory.add_pending_order(order_id, exit_order.ticker, 'SELL', exit_order.quantity, 'Submitted')
 
                     msg = (f"<b>SELL time limit:</b>\n"
-                           f"Ticker: {exit_order['ticker']}\n"
-                           f"Quantity: {exit_order['quantity']:g} pcs\n"
-                           f"{exit_order['days_held']} days held")
+                           f"Ticker: {exit_order.ticker}\n"
+                           f"Quantity: {exit_order.quantity:g} pcs\n"
+                           f"{exit_order.days_held} days held")
                     notifier.send_message(msg)
 
                 time.sleep(1)

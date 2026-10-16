@@ -7,6 +7,10 @@ from notifier import TelegramNotifier
 from bs4 import BeautifulSoup
 from logger import logger
 
+# SPAC units/warrants/rights, e.g. "PORT.", "ABC.U", "ABC.WS". Share classes like "BRK.B" must NOT match.
+UNTRADABLE_TICKER_RE = r'\.$|\.(?:U|UN|W|WS|WT|R|RT)$'
+
+
 class OpenInsiderFeeder:
     def __init__(self):
         self.cache_file = "feeder_cache.json"
@@ -61,6 +65,7 @@ class OpenInsiderFeeder:
                         'filing_date': tds[1].get_text(strip=True),
                         'trade_date':  tds[2].get_text(strip=True),
                         'ticker':      tds[3].get_text(strip=True),
+                        'company':     tds[4].get_text(strip=True),
                         'insider_name': tds[5].get_text(strip=True),
                         'title':       tds[6].get_text(strip=True),
                         'price':       tds[8].get_text(strip=True),
@@ -96,6 +101,12 @@ class OpenInsiderFeeder:
             for col in ['price', 'qty', 'owned', 'value']:
                 df[col] = df[col].replace(r'[\$,+]', '', regex=True).replace('', '0')
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+            if 'company' not in df.columns:  # caches written before this column existed
+                df['company'] = ''
+            skip = df['ticker'].str.contains(UNTRADABLE_TICKER_RE)
+            for ticker, company in df.loc[skip, ['ticker', 'company']].drop_duplicates().itertuples(index=False):
+                logger.info(f"Skipping {ticker} ({company}): unit/warrant/rights suffix, not tradable like a common stock.")
+            df = df[~skip].reset_index(drop=True)
             logger.info(f"Data ready: {len(df)} transactions.")
 
         return df

@@ -66,3 +66,12 @@ def test_fetch_insider_trades_http_error(mock_notifier_cls, mock_get, mock_exist
     df = feeder.get_latest_buys()
 
     assert df.empty
+
+@pytest.mark.parametrize("ticker, skipped", [
+    ("PORT.", True), ("ABC.U", True), ("ABC.UN", True), ("ABC.WS", True), ("ABC.RT", True),
+    ("BRK.B", False), ("BF.A", False), ("GME", False), ("U", False), ("RUN", False),
+])
+def test_untradable_ticker_regex(ticker, skipped):
+    """Units/warrants/rights are skipped; share classes and ordinary tickers are kept."""
+    from feeder import UNTRADABLE_TICKER_RE
+    assert bool(pd.Series([ticker]).str.contains(UNTRADABLE_TICKER_RE).iloc[0]) is skipped

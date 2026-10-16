@@ -13,7 +13,7 @@ from logger import logger
 class ExitOrder:
     action: str
     ticker: str
-    quantity: int
+    quantity: float
     days_held: int
     reason: str
 
@@ -44,7 +44,7 @@ class Exiter:
             for _, row in positions_df.iterrows():
                 ticker = row['ticker']
                 days_held = int(row['days_held'])
-                quantity = int(row['quantity'])
+                quantity = float(row['quantity'])
 
                 if ticker in pending_sells:
                     logger.info(f"   [SKIPPED] {ticker}: Sell already in progress.")

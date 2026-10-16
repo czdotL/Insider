@@ -10,7 +10,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from logger import logger
-from config import config
+from config import config, sqlalchemy_url
 
 
 class HistoryLogger:
@@ -18,7 +18,7 @@ class HistoryLogger:
         self.db_url = db_url or config.database_url
         self._lock = threading.Lock()
         self.conn = psycopg2.connect(self.db_url)
-        self.engine = create_engine(self.db_url)
+        self.engine = create_engine(sqlalchemy_url(self.db_url))
         self.cursor = self.conn.cursor()
         self._create_tables()
 

@@ -16,7 +16,7 @@ import pandas as pd
 import psycopg2
 from sqlalchemy import create_engine
 
-from config import config
+from config import config, sqlalchemy_url
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -94,7 +94,7 @@ class FundamentalAnalyzer:
         self._lock = threading.Lock()
         
         self.conn = psycopg2.connect(self.db_url)
-        self.engine = create_engine(self.db_url)
+        self.engine = create_engine(sqlalchemy_url(self.db_url))
         self.cursor = self.conn.cursor()
         
         self._create_tables()
@@ -394,7 +394,9 @@ class FundamentalAnalyzer:
         if 'error' in raw:
             result['status'] = 'ERROR'
             result['warnings'].append(f"Data fetch error: {raw['error']}")
-            analyzer_logger.error(f"Data fetch error for {ticker}: {raw['error']}")
+            # Empty yfinance data means delisted/unknown ticker, which is expected noise, not a bug (keep it out of Sentry)
+            log = analyzer_logger.warning if raw['error'].startswith('yfinance returned empty') else analyzer_logger.error
+            log(f"Data fetch error for {ticker}: {raw['error']}")
             if log_to_db:
                 self._log_analysis(result)
             return result

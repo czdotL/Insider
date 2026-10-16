@@ -7,7 +7,7 @@ from sqlalchemy import create_engine
 import pandas as pd
 
 from logger import logger
-from config import config
+from config import config, sqlalchemy_url
 
 class StateMemory:
     def __init__(self, db_url: str | None = None):
@@ -15,7 +15,7 @@ class StateMemory:
         self._lock = threading.Lock()
         
         self.conn = psycopg2.connect(self.db_url)
-        self.engine = create_engine(self.db_url)
+        self.engine = create_engine(sqlalchemy_url(self.db_url))
         self.cursor = self.conn.cursor()
         
         self._create_tables()
@@ -113,10 +113,14 @@ class StateMemory:
                 self.conn.rollback()
 
     def update_sl_tp(self, ticker: str, sl_price: float | None, tp_price: float | None) -> None:
+        """Only overwrites sl_price/tp_price when a new value is supplied, preserving the
+        previously known value for the leg that wasn't detected this cycle."""
         with self._lock:
             try:
                 self.cursor.execute('''
-                    UPDATE positions SET sl_price = %s, tp_price = %s
+                    UPDATE positions
+                    SET sl_price = COALESCE(%s, sl_price),
+                        tp_price = COALESCE(%s, tp_price)
                     WHERE ticker = %s
                 ''', (sl_price, tp_price, ticker))
                 self.conn.commit()

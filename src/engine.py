@@ -1,3 +1,4 @@
+import re
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -112,7 +113,7 @@ class StrategyEngine:
         raw_data['bdays_passed'] = np.busday_count(filing_dates_np, today_clean)
 
         # Config filters
-        pattern = '|'.join(config.titles)
+        pattern = '|'.join(re.escape(t) for t in config.titles)
         delay_min = config.entry_day_delay
         delay_max = config.entry_day_delay_max
         filtered_df = raw_data[

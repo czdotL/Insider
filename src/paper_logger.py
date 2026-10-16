@@ -1,4 +1,5 @@
 import threading
+import concurrent.futures
 import json
 import os
 import re
@@ -11,7 +12,7 @@ import psycopg2
 from sqlalchemy import create_engine
 
 from analyzer import FundamentalAnalyzer
-from config import config
+from config import config, sqlalchemy_url
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -109,24 +110,31 @@ PORTFOLIO_CONFIGS = [
 ]
 
 
+def yfinance_last_close(ticker: str) -> float | None:
+    """Fetches the latest available closing price for a ticker via yfinance, or None if unavailable."""
+    import yfinance as yf
+    try:
+        hist = yf.Ticker(ticker).history(period='5d')
+        if hist.empty or 'Close' not in hist.columns:
+            return None
+        close_series = hist['Close'].dropna()
+        if close_series.empty:
+            return None
+        last_close = float(close_series.iloc[-1])
+        return last_close if last_close > 0 else None
+    except Exception as e:
+        paper_logger.error(f"{ticker}: yfinance price error: {e}", exc_info=True)
+        return None
+
+
 def yfinance_price_fetcher(tickers: list[str]) -> dict[str, float]:
     if not tickers:
         return {}
-    import yfinance as yf
     prices = {}
     for tkr in tickers:
-        try:
-            hist = yf.Ticker(tkr).history(period='5d')
-            if hist.empty or 'Close' not in hist.columns:
-                continue
-            close_series = hist['Close'].dropna()
-            if close_series.empty:
-                continue
-            last_close = float(close_series.iloc[-1])
-            if last_close > 0:
-                prices[tkr] = last_close
-        except Exception as e:
-            paper_logger.error(f"{tkr}: yfinance price error: {e}", exc_info=True)
+        price = yfinance_last_close(tkr)
+        if price is not None:
+            prices[tkr] = price
     return prices
 
 
@@ -154,7 +162,7 @@ class PaperLogger:
         self._lock = threading.Lock()
         
         self.conn = psycopg2.connect(self.db_url)
-        self.engine = create_engine(self.db_url)
+        self.engine = create_engine(sqlalchemy_url(self.db_url))
         self.cursor = self.conn.cursor()
         
         self._create_tables()
@@ -242,6 +250,18 @@ class PaperLogger:
                         entry_cost REAL,
                         FOREIGN KEY (portfolio_label) REFERENCES paper_portfolios(label),
                         FOREIGN KEY (position_id) REFERENCES paper_positions(id)
+                    )
+                ''')
+                self.cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS price_checks (
+                        id SERIAL PRIMARY KEY,
+                        checked_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                        ticker TEXT NOT NULL,
+                        insider_price REAL NOT NULL,
+                        market_price REAL NOT NULL,
+                        source TEXT NOT NULL,
+                        diff_pct REAL NOT NULL,
+                        replaced BOOLEAN NOT NULL
                     )
                 ''')
                 self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_pos_open ON paper_positions(exit_date, strategy)')
@@ -728,11 +748,24 @@ class PaperLogger:
 
         paper_logger.info(f"Processing paper signal for {ticker}...")
 
-        analysis = self.analyzer.analyze(ticker, log_to_db=False)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            analysis_future = pool.submit(self.analyzer.analyze, ticker, log_to_db=False)
+            info_future = pool.submit(self._fetch_yfinance_info, ticker)
+            option_future = pool.submit(self._fetch_option_snapshot, ticker)
+            avg_volume_future = pool.submit(self._fetch_avg_volume, ticker)
+            regime_future = pool.submit(self._get_market_regime)
+            pattern_future = pool.submit(self._fetch_price_pattern, ticker)
+
+            analysis = analysis_future.result()
+            info = info_future.result()
+            iv_at_signal, option_snapshot = option_future.result()
+            avg_volume = avg_volume_future.result()
+            market_regime = regime_future.result()
+            price_pattern = pattern_future.result()
+
         f_score = analysis.get('f_score')
         f_status = analysis.get('status', 'ERROR')
 
-        info = self._fetch_yfinance_info(ticker)
         ev_ebitda = info['ev_ebitda']
         sector = info['sector']
         industry = info['industry']
@@ -740,11 +773,6 @@ class PaperLogger:
         bid_at_signal = info.get('bid')
         ask_at_signal = info.get('ask')
         is_financial = self._is_financial(sector, industry)
-
-        iv_at_signal, option_snapshot = self._fetch_option_snapshot(ticker)
-        avg_volume = self._fetch_avg_volume(ticker)
-        market_regime = self._get_market_regime()
-        price_pattern = self._fetch_price_pattern(ticker)
 
         raw_price = signal.get('entry_price') or signal.get('insider_price')
         share_price = self._validate_entry_price(ticker, raw_price) if (raw_price and raw_price > 0) else raw_price
@@ -834,6 +862,20 @@ class PaperLogger:
         paper_logger.info(f"Analysis complete for {ticker} (ID: {signal_id})")
         return signal_id
 
+    def _log_price_check(self, ticker: str, insider_price: float, market_price: float,
+                         source: str, diff_pct: float, replaced: bool) -> None:
+        """Records every insider-vs-market comparison so mismatch patterns can be analysed later."""
+        with self._lock:
+            try:
+                self.cursor.execute('''
+                    INSERT INTO price_checks (ticker, insider_price, market_price, source, diff_pct, replaced)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                ''', (ticker, insider_price, market_price, source, diff_pct, replaced))
+                self.conn.commit()
+            except Exception as e:
+                paper_logger.error(f"Error logging price check for {ticker}: {e}", exc_info=True)
+                self.conn.rollback()
+
     def _validate_entry_price(self, ticker: str, insider_price: float) -> float:
         market_price = None
         source = None
@@ -849,24 +891,18 @@ class PaperLogger:
                 pass
 
         if market_price is None:
-            try:
-                import yfinance as yf
-                hist = yf.Ticker(ticker).history(period='5d')
-                if not hist.empty and 'Close' in hist.columns:
-                    close_series = hist['Close'].dropna()
-                    if not close_series.empty:
-                        last_close = float(close_series.iloc[-1])
-                        if last_close > 0:
-                            market_price = last_close
-                            source = 'yfinance'
-            except Exception:
-                pass
+            price = yfinance_last_close(ticker)
+            if price is not None:
+                market_price = price
+                source = 'yfinance'
 
         if market_price is None:
             return insider_price
 
         diff_pct = abs(insider_price - market_price) / market_price
-        if diff_pct > 0.5:
+        replaced = diff_pct > 0.5
+        self._log_price_check(ticker, insider_price, market_price, source, diff_pct, replaced)
+        if replaced:
             paper_logger.warning(f"{ticker}: Insider price ${insider_price:.2f} unrealistic "
                                  f"({source}: ${market_price:.2f}) -> using {source}.")
             return market_price

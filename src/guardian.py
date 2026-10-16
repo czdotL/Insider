@@ -33,17 +33,12 @@ class Guardian:
 
         missing = [t for t in tickers if t not in prices]
         if missing:
-            try:
-                import yfinance as yf
-                for tkr in missing:
-                    hist = yf.Ticker(tkr).history(period='5d')
-                    if not hist.empty and 'Close' in hist.columns:
-                        close = float(hist['Close'].dropna().iloc[-1])
-                        if close > 0:
-                            prices[tkr] = close
-                            logger.info(f"   [FALLBACK] {tkr}: yfinance price obtained at ${close:.2f}")
-            except Exception as e:
-                logger.error(f"yfinance fallback price failed to acquire: {e}", exc_info=True)
+            from paper_logger import yfinance_last_close
+            for tkr in missing:
+                price = yfinance_last_close(tkr)
+                if price is not None:
+                    prices[tkr] = price
+                    logger.info(f"   [FALLBACK] {tkr}: yfinance price obtained at ${price:.2f}")
 
         return prices
 
